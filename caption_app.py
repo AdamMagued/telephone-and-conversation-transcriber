@@ -27,6 +27,72 @@ def load_config():
 
 CONFIG = load_config()
 
+
+def save_config(updates):
+    """Save config updates to CONFIG_PATH, preserving existing keys."""
+    try:
+        dir_name = os.path.dirname(CONFIG_PATH)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        current = load_config()
+        current.update(updates)
+        with open(CONFIG_PATH, 'w') as f:
+            json.dump(current, f, indent=4)
+        CONFIG.update(current)
+        return True
+    except Exception as e:
+        print(f"Warning: Failed to save config: {e}", flush=True)
+        return False
+
+
+# Caption font size configuration and boundary limits
+MIN_FONT_SIZE = 16
+MAX_FONT_SIZE = 72
+DEFAULT_FONT_SIZE = 36
+FONT_SIZE_STEP = 4
+
+FONT_PRESETS = {
+    'S': 28,
+    'M': 36,
+    'L': 48,
+}
+
+
+def clamp_font_size(size):
+    """Normalize and clamp font size within boundary guards."""
+    if isinstance(size, str):
+        size_upper = size.strip().upper()
+        if size_upper in FONT_PRESETS:
+            return FONT_PRESETS[size_upper]
+        try:
+            size = float(size)
+        except (ValueError, TypeError):
+            return DEFAULT_FONT_SIZE
+    try:
+        val = int(round(float(size)))
+    except (TypeError, ValueError):
+        val = DEFAULT_FONT_SIZE
+    return max(MIN_FONT_SIZE, min(MAX_FONT_SIZE, val))
+
+
+def get_next_font_size(current_size, step=FONT_SIZE_STEP):
+    """Calculate next incremental font size bounded by MAX_FONT_SIZE."""
+    current = clamp_font_size(current_size)
+    return clamp_font_size(current + step)
+
+
+def get_prev_font_size(current_size, step=FONT_SIZE_STEP):
+    """Calculate previous decremental font size bounded by MIN_FONT_SIZE."""
+    current = clamp_font_size(current_size)
+    return clamp_font_size(current - step)
+
+
+def save_font_size(size):
+    """Persist font size setting to configuration file."""
+    clamped = clamp_font_size(size)
+    return save_config({'font_size': clamped})
+
+
 # Paths
 VOSK_MODEL = os.path.expanduser('~/vosk-uk')
 FONT_PATH = os.path.expanduser('~/gramps-transcriber/fonts/DSEG14Classic-Bold.ttf')
@@ -1388,8 +1454,12 @@ class ClockView(QWidget):
 class CaptionView(QWidget):
     def __init__(self):
         super().__init__()
-        self.font_sizes = {'S': 28, 'M': 36, 'L': 48}
-        self.current_size = 'M'
+        self.font_sizes = dict(FONT_PRESETS)
+        initial_font_size = clamp_font_size(
+            CONFIG.get('font_size', DEFAULT_FONT_SIZE)
+        )
+        self.font_size = initial_font_size
+        self.current_size = initial_font_size
         self.color_schemes = [
             ('W/B', '#ffffff', '#000000'),
             ('B/W', '#000000', '#ffffff'),
@@ -1404,12 +1474,16 @@ class CaptionView(QWidget):
         top_bar = QHBoxLayout()
 
         self.size_buttons = {}
-        for size in ['S', 'M', 'L']:
-            btn = QLabel(size)
+        for key, text, handler in [
+            ('-', '−', lambda e: self.decrease_font_size()),
+            ('+', '+', lambda e: self.increase_font_size()),
+            ('0', '0', lambda e: self.reset_font_size()),
+        ]:
+            btn = QLabel(text)
             btn.setFixedSize(50, 50)
             btn.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            btn.mousePressEvent = lambda e, s=size: self.set_size(s)
-            self.size_buttons[size] = btn
+            btn.mousePressEvent = handler
+            self.size_buttons[key] = btn
             top_bar.addWidget(btn)
 
         spacer = QLabel('  ')
@@ -1460,7 +1534,7 @@ class CaptionView(QWidget):
 
         self.update_size_buttons()
         self.update_color_buttons()
-        self.set_size('M')
+        self.set_font_size(initial_font_size, persist=False)
         self.set_color(0)
         self._waiting_for_ready = False
         self._last_text_time = 0
@@ -1496,10 +1570,33 @@ class CaptionView(QWidget):
         self.current_mode = mode
         self.update_mode_button()
 
-    def set_size(self, size):
-        self.current_size = size
-        self.text.setFont(QFont('Helvetica', self.font_sizes[size], QFont.Weight.Bold))
+    def set_font_size(self, size, persist=True):
+        new_size = clamp_font_size(size)
+        self.font_size = new_size
+        self.current_size = new_size
+        font = QFont('Helvetica', new_size, QFont.Weight.Bold)
+        self.text.setFont(font)
+        self.text.document().setDefaultFont(font)
         self.update_size_buttons()
+        if persist:
+            save_font_size(new_size)
+
+    def set_size(self, size):
+        self.set_font_size(size)
+
+    def increase_font_size(self):
+        new_size = get_next_font_size(self.font_size)
+        if new_size != self.font_size:
+            self.set_font_size(new_size)
+
+    def decrease_font_size(self):
+        new_size = get_prev_font_size(self.font_size)
+        if new_size != self.font_size:
+            self.set_font_size(new_size)
+
+    def reset_font_size(self):
+        if self.font_size != DEFAULT_FONT_SIZE:
+            self.set_font_size(DEFAULT_FONT_SIZE)
 
     def set_color(self, idx):
         self.current_scheme = idx
@@ -1509,11 +1606,48 @@ class CaptionView(QWidget):
         self.update_color_buttons()
 
     def update_size_buttons(self):
-        for size, btn in self.size_buttons.items():
-            if size == self.current_size:
-                btn.setStyleSheet('background: #444; color: white; border-radius: 25px; font-size: 24px; font-weight: bold;')
+        if not hasattr(self, 'size_buttons'):
+            return
+
+        dec_btn = self.size_buttons.get('-')
+        inc_btn = self.size_buttons.get('+')
+        reset_btn = self.size_buttons.get('0')
+
+        if dec_btn:
+            if self.font_size <= MIN_FONT_SIZE:
+                dec_btn.setStyleSheet(
+                    'background: #181818; color: #444; '
+                    'border-radius: 25px; font-size: 24px;'
+                )
             else:
-                btn.setStyleSheet('background: #222; color: #888; border-radius: 25px; font-size: 24px;')
+                dec_btn.setStyleSheet(
+                    'background: #222; color: white; '
+                    'border-radius: 25px; font-size: 24px; font-weight: bold;'
+                )
+
+        if inc_btn:
+            if self.font_size >= MAX_FONT_SIZE:
+                inc_btn.setStyleSheet(
+                    'background: #181818; color: #444; '
+                    'border-radius: 25px; font-size: 24px;'
+                )
+            else:
+                inc_btn.setStyleSheet(
+                    'background: #222; color: white; '
+                    'border-radius: 25px; font-size: 24px; font-weight: bold;'
+                )
+
+        if reset_btn:
+            if self.font_size == DEFAULT_FONT_SIZE:
+                reset_btn.setStyleSheet(
+                    'background: #444; color: white; '
+                    'border-radius: 25px; font-size: 24px; font-weight: bold;'
+                )
+            else:
+                reset_btn.setStyleSheet(
+                    'background: #222; color: #888; '
+                    'border-radius: 25px; font-size: 24px;'
+                )
 
     def update_color_buttons(self):
         for i, btn in enumerate(self.color_buttons):
